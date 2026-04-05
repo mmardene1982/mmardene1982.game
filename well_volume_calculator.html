@@ -7,7 +7,306 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500&family=Syne:wght@700;800&display=swap" rel="stylesheet">
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <script>
+  (() => {
+    const XML_NS = 'http://www.w3.org/XML/1998/namespace';
+    const textDecoder = new TextDecoder('utf-8');
+    const hasDecompressionStream = typeof DecompressionStream !== 'undefined';
+
+    function escapeXml(value) {
+      return String(value ?? '').replace(/[<>&"']/g, ch => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&apos;' }[ch]));
+    }
+
+    function columnName(index) {
+      let n = index + 1;
+      let out = '';
+      while (n > 0) {
+        const rem = (n - 1) % 26;
+        out = String.fromCharCode(65 + rem) + out;
+        n = Math.floor((n - 1) / 26);
+      }
+      return out;
+    }
+
+    function columnIndex(ref) {
+      let idx = 0;
+      for (let i = 0; i < ref.length; i++) idx = idx * 26 + (ref.charCodeAt(i) - 64);
+      return idx - 1;
+    }
+
+    function cellRef(rowIndex, colIndex) {
+      return `${columnName(colIndex)}${rowIndex + 1}`;
+    }
+
+    function dateSerial(date) {
+      const epoch = Date.UTC(1899, 11, 30);
+      return (date.getTime() - epoch) / 86400000;
+    }
+
+    function crc32(buf) {
+      let c = ~0;
+      for (let i = 0; i < buf.length; i++) {
+        c ^= buf[i];
+        for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (0xEDB88320 & -(c & 1));
+      }
+      return (~c) >>> 0;
+    }
+
+    async function inflateRaw(bytes) {
+      if (!hasDecompressionStream) throw new Error('This browser does not support offline XLSX decompression.');
+      const ds = new DecompressionStream('deflate-raw');
+      const stream = new Blob([bytes]).stream().pipeThrough(ds);
+      return new Uint8Array(await new Response(stream).arrayBuffer());
+    }
+
+    async function unzip(buffer) {
+      const bytes = new Uint8Array(buffer);
+      if (bytes[0] !== 0x50 || bytes[1] !== 0x4B) throw new Error('Offline mode supports .xlsx workbooks only.');
+      let eocd = -1;
+      for (let i = bytes.length - 22; i >= Math.max(0, bytes.length - 65557); i--) {
+        if (bytes[i] === 0x50 && bytes[i + 1] === 0x4B && bytes[i + 2] === 0x05 && bytes[i + 3] === 0x06) { eocd = i; break; }
+      }
+      if (eocd < 0) throw new Error('Invalid XLSX zip structure.');
+      const view = new DataView(buffer);
+      const cdSize = view.getUint32(eocd + 12, true);
+      const cdOffset = view.getUint32(eocd + 16, true);
+      const files = new Map();
+      let ptr = cdOffset;
+      while (ptr < cdOffset + cdSize) {
+        if (view.getUint32(ptr, true) !== 0x02014b50) break;
+        const compression = view.getUint16(ptr + 10, true);
+        const compressedSize = view.getUint32(ptr + 20, true);
+        const nameLen = view.getUint16(ptr + 28, true);
+        const extraLen = view.getUint16(ptr + 30, true);
+        const commentLen = view.getUint16(ptr + 32, true);
+        const localOffset = view.getUint32(ptr + 42, true);
+        const name = textDecoder.decode(bytes.slice(ptr + 46, ptr + 46 + nameLen));
+        const lfNameLen = view.getUint16(localOffset + 26, true);
+        const lfExtraLen = view.getUint16(localOffset + 28, true);
+        const dataStart = localOffset + 30 + lfNameLen + lfExtraLen;
+        const compressed = bytes.slice(dataStart, dataStart + compressedSize);
+        let content;
+        if (compression === 0) content = compressed;
+        else if (compression === 8) content = await inflateRaw(compressed);
+        else throw new Error(`Unsupported XLSX compression method: ${compression}`);
+        files.set(name, textDecoder.decode(content));
+        ptr += 46 + nameLen + extraLen + commentLen;
+      }
+      return files;
+    }
+
+    function xmlDoc(xml) {
+      return new DOMParser().parseFromString(xml, 'application/xml');
+    }
+
+    function getText(node) {
+      return node ? node.textContent ?? '' : '';
+    }
+
+    function parseSharedStrings(xml) {
+      if (!xml) return [];
+      return Array.from(xmlDoc(xml).getElementsByTagName('si')).map(si =>
+        Array.from(si.getElementsByTagName('t')).map(t => t.textContent || '').join('')
+      );
+    }
+
+    function resolvePath(base, target) {
+      if (target.startsWith('/')) return target.slice(1);
+      const stack = base.split('/').slice(0, -1);
+      target.split('/').forEach(part => {
+        if (!part || part === '.') return;
+        if (part === '..') stack.pop(); else stack.push(part);
+      });
+      return stack.join('/');
+    }
+
+    function parseWorkbookMeta(files) {
+      const workbookXml = files.get('xl/workbook.xml');
+      if (!workbookXml) throw new Error('Missing xl/workbook.xml in workbook.');
+      const workbook = xmlDoc(workbookXml);
+      const relsXml = files.get('xl/_rels/workbook.xml.rels');
+      const rels = relsXml ? xmlDoc(relsXml) : null;
+      const relMap = new Map();
+      if (rels) Array.from(rels.getElementsByTagName('Relationship')).forEach(rel => relMap.set(rel.getAttribute('Id'), rel.getAttribute('Target')));
+      const sheets = Array.from(workbook.getElementsByTagName('sheet')).map(sheet => {
+        const rid = sheet.getAttributeNS('http://schemas.openxmlformats.org/officeDocument/2006/relationships', 'id') || sheet.getAttribute('r:id');
+        const target = relMap.get(rid) || `worksheets/${sheet.getAttribute('name')}.xml`;
+        return { name: sheet.getAttribute('name') || 'Sheet1', path: resolvePath('xl/workbook.xml', `xl/${target.replace(/^\/?xl\//, '')}`) };
+      });
+      if (!sheets.length) throw new Error('Workbook does not contain any sheets.');
+      return sheets;
+    }
+
+    function parseSheet(xml, sharedStrings) {
+      const doc = xmlDoc(xml);
+      const rows = [];
+      Array.from(doc.getElementsByTagName('row')).forEach(rowNode => {
+        const row = [];
+        Array.from(rowNode.getElementsByTagName('c')).forEach(cell => {
+          const ref = cell.getAttribute('r') || '';
+          const colLetters = ref.replace(/\d+/g, '');
+          const idx = colLetters ? columnIndex(colLetters) : row.length;
+          const type = cell.getAttribute('t');
+          let value = null;
+          if (type === 'inlineStr') value = getText(cell.getElementsByTagName('t')[0]);
+          else if (type === 's') value = sharedStrings[Number(getText(cell.getElementsByTagName('v')[0]))] ?? null;
+          else if (type === 'b') value = getText(cell.getElementsByTagName('v')[0]) === '1';
+          else {
+            const raw = getText(cell.getElementsByTagName('v')[0]);
+            value = raw === '' ? null : Number(raw);
+            if (raw !== '' && !Number.isFinite(value)) value = raw;
+          }
+          row[idx] = value;
+        });
+        rows.push(row);
+      });
+      return { data: rows };
+    }
+
+    function sheet_to_json(sheet, opts = {}) {
+      const defval = Object.prototype.hasOwnProperty.call(opts, 'defval') ? opts.defval : null;
+      const data = sheet?.data || [];
+      if (!data.length) return [];
+      const headers = data[0].map((h, i) => (h == null || h === '') ? `__EMPTY_${i}` : String(h));
+      return data.slice(1).map(row => {
+        const out = {};
+        headers.forEach((header, i) => { out[header] = row[i] ?? defval; });
+        return out;
+      });
+    }
+
+    function aoa_to_sheet(data) { return { data: data.map(row => [...row]) }; }
+
+    function json_to_sheet(rows) {
+      const headers = [...rows.reduce((set, row) => {
+        Object.keys(row || {}).forEach(k => set.add(k));
+        return set;
+      }, new Set())];
+      return { data: [headers, ...rows.map(row => headers.map(h => row?.[h] ?? null))] };
+    }
+
+    function book_new() { return { SheetNames: [], Sheets: {} }; }
+    function book_append_sheet(wb, sheet, name) { wb.SheetNames.push(name); wb.Sheets[name] = sheet; }
+
+    function sheetXml(name, sheet) {
+      const rows = sheet?.data || [];
+      const rowXml = rows.map((row, rIdx) => {
+        const cells = row.map((value, cIdx) => {
+          if (value == null || value === '') return '';
+          const ref = cellRef(rIdx, cIdx);
+          if (typeof value === 'number') return `<c r="${ref}"><v>${value}</v></c>`;
+          if (typeof value === 'boolean') return `<c r="${ref}" t="b"><v>${value ? 1 : 0}</v></c>`;
+          if (value instanceof Date) return `<c r="${ref}"><v>${dateSerial(value)}</v></c>`;
+          return `<c r="${ref}" t="inlineStr"><is><t>${escapeXml(value)}</t></is></c>`;
+        }).join('');
+        return `<row r="${rIdx + 1}">${cells}</row>`;
+      }).join('');
+      return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>${rowXml}</sheetData></worksheet>`;
+    }
+
+    function buildWorkbookXml(names) {
+      const sheets = names.map((name, i) => `<sheet name="${escapeXml(name)}" sheetId="${i + 1}" r:id="rId${i + 1}"/>`).join('');
+      return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>${sheets}</sheets></workbook>`;
+    }
+
+    function buildWorkbookRels(names) {
+      const rels = names.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i + 1}.xml"/>`).join('');
+      return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${rels}</Relationships>`;
+    }
+
+    function buildRootRels() {
+      return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>`;
+    }
+
+    function buildContentTypes(names) {
+      const overrides = [
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>',
+        ...names.map((_, i) => `<Override PartName="/xl/worksheets/sheet${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`),
+      ].join('');
+      return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/>${overrides}</Types>`;
+    }
+
+    function zipStore(files) {
+      const encoder = new TextEncoder();
+      const localParts = [];
+      const centralParts = [];
+      let offset = 0;
+      files.forEach(file => {
+        const nameBytes = encoder.encode(file.name);
+        const dataBytes = encoder.encode(file.data);
+        const crc = crc32(dataBytes);
+        const local = new Uint8Array(30 + nameBytes.length + dataBytes.length);
+        const lv = new DataView(local.buffer);
+        lv.setUint32(0, 0x04034b50, true);
+        lv.setUint16(4, 20, true); lv.setUint16(6, 0, true); lv.setUint16(8, 0, true);
+        lv.setUint32(14, crc, true); lv.setUint32(18, dataBytes.length, true); lv.setUint32(22, dataBytes.length, true);
+        lv.setUint16(26, nameBytes.length, true); lv.setUint16(28, 0, true);
+        local.set(nameBytes, 30); local.set(dataBytes, 30 + nameBytes.length);
+        localParts.push(local);
+
+        const central = new Uint8Array(46 + nameBytes.length);
+        const cv = new DataView(central.buffer);
+        cv.setUint32(0, 0x02014b50, true);
+        cv.setUint16(4, 20, true); cv.setUint16(6, 20, true); cv.setUint16(8, 0, true); cv.setUint16(10, 0, true);
+        cv.setUint32(16, crc, true); cv.setUint32(20, dataBytes.length, true); cv.setUint32(24, dataBytes.length, true);
+        cv.setUint16(28, nameBytes.length, true); cv.setUint16(30, 0, true); cv.setUint16(32, 0, true); cv.setUint16(34, 0, true); cv.setUint16(36, 0, true);
+        cv.setUint32(42, offset, true);
+        central.set(nameBytes, 46);
+        centralParts.push(central);
+        offset += local.length;
+      });
+      const centralSize = centralParts.reduce((n, part) => n + part.length, 0);
+      const end = new Uint8Array(22);
+      const ev = new DataView(end.buffer);
+      ev.setUint32(0, 0x06054b50, true);
+      ev.setUint16(8, files.length, true); ev.setUint16(10, files.length, true); ev.setUint32(12, centralSize, true); ev.setUint32(16, offset, true);
+      const total = offset + centralSize + end.length;
+      const out = new Uint8Array(total);
+      let ptr = 0;
+      [...localParts, ...centralParts, end].forEach(part => { out.set(part, ptr); ptr += part.length; });
+      return out;
+    }
+
+    async function read(buffer) {
+      const files = await unzip(buffer);
+      const sheets = parseWorkbookMeta(files);
+      const sharedStrings = parseSharedStrings(files.get('xl/sharedStrings.xml'));
+      const book = { SheetNames: sheets.map(s => s.name), Sheets: {} };
+      sheets.forEach(sheet => { book.Sheets[sheet.name] = parseSheet(files.get(sheet.path), sharedStrings); });
+      return book;
+    }
+
+    function writeFile(workbook, filename) {
+      const names = workbook.SheetNames || [];
+      const files = [
+        { name: '[Content_Types].xml', data: buildContentTypes(names) },
+        { name: '_rels/.rels', data: buildRootRels() },
+        { name: 'xl/workbook.xml', data: buildWorkbookXml(names) },
+        { name: 'xl/_rels/workbook.xml.rels', data: buildWorkbookRels(names) },
+        ...names.map((name, i) => ({ name: `xl/worksheets/sheet${i + 1}.xml`, data: sheetXml(name, workbook.Sheets[name]) })),
+      ];
+      const blob = new Blob([zipStore(files)], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      link.download = filename || 'workbook.xlsx';
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+    }
+
+    window.XLSX = {
+      read,
+      writeFile,
+      utils: { sheet_to_json, aoa_to_sheet, json_to_sheet, book_new, book_append_sheet },
+    };
+  })();
+</script>
   <style>
     :root {
       --bg: #0a0e14;
@@ -311,7 +610,21 @@
     const num = v => {
       if (typeof v === 'number') return v;
       if (v == null) return NaN;
-      const cleaned = String(v).replace(/,/g, '.').replace(/[^0-9.+-]/g, '');
+      let s = String(v).trim();
+      if (!s) return NaN;
+      s = s.replace(/[\s ]/g, '').replace(/[^0-9,.-]/g, '');
+      if (!s) return NaN;
+      const hasComma = s.includes(',');
+      const hasDot = s.includes('.');
+      if (hasComma && hasDot) {
+        if (s.lastIndexOf(',') > s.lastIndexOf('.')) s = s.replace(/\./g, '').replace(/,/g, '.');
+        else s = s.replace(/,/g, '');
+      } else if (hasComma) {
+        const parts = s.split(',');
+        if (parts.length > 2 || (parts.length === 2 && parts[1].length !== 3)) s = s.replace(/,/g, '.');
+        else s = s.replace(/,/g, '');
+      }
+      const cleaned = s.replace(/(?!^)[+-]/g, '');
       return cleaned ? parseFloat(cleaned) : NaN;
     };
     const stripHtml = txt => String(txt ?? '').replace(/<br\s*\/?\s*>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
@@ -430,12 +743,16 @@
     }
 
     function parseWorkbook(file, onDone, onError) {
+      if (!window.XLSX) {
+        onError(new Error('Spreadsheet engine failed to load. Reopen the HTML file and try again.'));
+        return;
+      }
       const reader = new FileReader();
-      reader.onload = evt => {
+      reader.onload = async evt => {
         try {
-          const wb = XLSX.read(evt.target.result, { type: 'array' });
+          const wb = await XLSX.read(evt.target.result, { type: 'array', raw: true });
           const ws = wb.Sheets[wb.SheetNames[0]];
-          const json = XLSX.utils.sheet_to_json(ws, { defval: null, raw: false });
+          const json = XLSX.utils.sheet_to_json(ws, { defval: null, raw: true });
           onDone(json);
         } catch (err) {
           onError(err);
@@ -598,28 +915,41 @@
       tally.forEach(row => {
         const cTop = Math.max(row.md_top, hangerMd);
         const cBot = Math.min(row.md_bottom, packerMd);
-        const len = cBot - cTop;
-        if (len <= 0) return;
+        if (cBot <= cTop) return;
         const tubingOdM = row.od_in * 25.4 / 1000;
-        const mid = (cTop + cBot) / 2;
-        const { idM: casingIdM, casing: selectedCasing } = innermostCasingIdAt(mid, casingWithId, fallbackIdM);
-        if (!(casingIdM > tubingOdM)) return;
-        const sectionVol = Math.PI / 4 * (casingIdM ** 2 - tubingOdM ** 2) * len;
-        annVol += sectionVol;
-        cumVol += sectionVol;
-        tubingOdNumerator += tubingOdM * len;
-        tubingOdDenominator += len;
-        annRows.push({
-          casingLabel: selectedCasing?.string_name || prodCasing?.string_name || 'Production Casing',
-          top_md: cTop,
-          bottom_md: cBot,
-          length: len,
-          casingIdM,
-          casingIdMm: casingIdM * 1000,
-          tubingOdM,
-          sectionVol,
-          cumVol,
+        const splitPoints = new Set([cTop, cBot]);
+        casingWithId.forEach(cas => {
+          const overlaps = cas.bottom_md > cTop && cas.top_md < cBot;
+          if (!overlaps) return;
+          if (cas.top_md > cTop && cas.top_md < cBot) splitPoints.add(cas.top_md);
+          if (cas.bottom_md > cTop && cas.bottom_md < cBot) splitPoints.add(cas.bottom_md);
         });
+        const points = [...splitPoints].sort((a,b) => a - b);
+        for (let i = 0; i < points.length - 1; i++) {
+          const segTop = points[i];
+          const segBot = points[i + 1];
+          const len = segBot - segTop;
+          if (len <= 0) continue;
+          const mid = segTop + len / 2;
+          const { idM: casingIdM, casing: selectedCasing } = innermostCasingIdAt(mid, casingWithId, fallbackIdM);
+          if (!(casingIdM > tubingOdM)) continue;
+          const sectionVol = Math.PI / 4 * (casingIdM ** 2 - tubingOdM ** 2) * len;
+          annVol += sectionVol;
+          cumVol += sectionVol;
+          tubingOdNumerator += tubingOdM * len;
+          tubingOdDenominator += len;
+          annRows.push({
+            casingLabel: selectedCasing?.string_name || prodCasing?.string_name || 'Production Casing',
+            top_md: segTop,
+            bottom_md: segBot,
+            length: len,
+            casingIdM,
+            casingIdMm: casingIdM * 1000,
+            tubingOdM,
+            sectionVol,
+            cumVol,
+          });
+        }
       });
       return {
         annVol,
